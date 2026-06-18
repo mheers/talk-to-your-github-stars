@@ -1,0 +1,27 @@
+# Binaries
+/ttygs
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+*.out
+vendor/
+
+# Data
+data/
+tmp/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Env
+.env
+.envrc
+
+# IDE
+.vscode/
+.idea/
