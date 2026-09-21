@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/mheers/talk-to-your-github-stars/internal/embed"
 	"github.com/mheers/talk-to-your-github-stars/internal/github"
 	"github.com/mheers/talk-to-your-github-stars/internal/llm"
+	"github.com/mheers/talk-to-your-github-stars/internal/mcpserver"
 	"github.com/mheers/talk-to-your-github-stars/internal/rag"
 	"github.com/mheers/talk-to-your-github-stars/internal/store"
 	"github.com/mheers/talk-to-your-github-stars/internal/tui"
@@ -35,6 +38,8 @@ func main() {
 		chatCmd()
 	case "ask":
 		askCmd(os.Args[2:])
+	case "mcp":
+		mcpCmd(os.Args[2:])
 	case "version":
 		fmt.Println("ttygs 0.1.0")
 	default:
@@ -44,12 +49,13 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: ttygs <sync|ingest|chat|ask|version>")
+	fmt.Fprintln(os.Stderr, "Usage: ttygs <sync|ingest|chat|ask|mcp|version>")
 	fmt.Fprintln(os.Stderr, "\nCommands:")
 	fmt.Fprintln(os.Stderr, "  sync [--graphql]  Fetch/refresh starred repositories from GitHub (REST by default)")
-	fmt.Fprintln(os.Stderr, "  ingest      Chunk READMEs and index them into sqlite-vec")
+	fmt.Fprintln(os.Stderr, "  ingest      Chunk READMEs and store their embeddings in SQLite")
 	fmt.Fprintln(os.Stderr, "  chat        Open the interactive TUI")
 	fmt.Fprintln(os.Stderr, "  ask <query> Ask a single question from the terminal")
+	fmt.Fprintln(os.Stderr, "  mcp         Run an MCP server (stdio) exposing the local stars database")
 	fmt.Fprintln(os.Stderr, "  version     Print version")
 }
 
@@ -78,6 +84,10 @@ func syncCmd(args []string) {
 
 	cfg, database, _, _ := loadBase()
 	defer database.Close()
+
+	if cfg.GitHubToken == "" {
+		log.Fatal("GITHUB_TOKEN environment variable is required for `ttygs sync`")
+	}
 
 	log.Println("[sync] starting GitHub starred repository sync")
 	gh := github.New(cfg, *useGraphQL)
@@ -161,4 +171,48 @@ func askCmd(args []string) {
 	}
 
 	fmt.Println(answer)
+}
+
+// mcpCmd runs the MCP server on stdio. It exposes the local stars database
+// to any MCP-compatible coding agent. The server is read-only and safe to
+// run concurrently with `ttygs chat` etc.
+//
+// Example client configuration (Claude Desktop / VS Code etc.):
+//
+//	{
+//	  "mcpServers": {
+//	    "ttygs": {
+//	      "command": "/absolute/path/to/ttygs",
+//	      "args": ["mcp"],
+//	      "env": { "TTYGS_DATA_HOME": "/absolute/path/to/data" }
+//	    }
+//	  }
+//	}
+//
+// The embedder is only needed if you want the vector_search tool. With no
+// OPENAI_API_KEY the other two tools still work.
+func mcpCmd(args []string) {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("parse flags: %v", err)
+	}
+
+	cfg, database, emb, _ := loadBase()
+	defer database.Close()
+
+	// Pass a nil embedder when no API key is configured so the
+	// vector_search tool returns a clear "disabled" message instead of a
+	// confusing 401 from the embeddings API.
+	if cfg.OpenAIKey == "" {
+		emb = nil
+		log.Println("[mcp] OPENAI_API_KEY is not set; the vector_search tool will return an error. The list_repos and get_repo tools still work.")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	log.Printf("[mcp] starting stdio server (name=%s, version=%s, db=%s)", mcpserver.ServerName, mcpserver.ServerVersion, cfg.DBPath)
+	if err := mcpserver.New(database, emb).Run(ctx); err != nil && err != context.Canceled {
+		log.Fatalf("mcp server: %v", err)
+	}
 }

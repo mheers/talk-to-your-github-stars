@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -261,19 +262,22 @@ func (d *DB) GetRepo(id int64) (*Repo, error) {
 
 // SearchRepos returns repositories whose metadata matches the query.
 // It searches the full name, description, topics and README text.
+// The query is matched literally: SQL LIKE wildcards (%, _) are escaped,
+// so a query of "%" only matches repositories that contain a literal "%".
 func (d *DB) SearchRepos(query string) ([]*Repo, error) {
 	q := strings.TrimSpace(query)
 	if q == "" {
 		return d.ListRepos()
 	}
-	pattern := "%" + q + "%"
+	pattern := "%" + escapeLike(q) + "%"
 	rows, err := d.db.Query(`
 		SELECT id, node_id, owner, name, full_name, description, homepage, url, language,
 			stars, watchers, forks, open_issues, open_prs, commits, contributors,
 			topics, languages, license, is_fork, is_archived, is_private,
 			created_at, updated_at, pushed_at, last_commit_at, last_release_at, readme_text, synced_at
 		FROM repos
-		WHERE full_name LIKE ? OR description LIKE ? OR topics LIKE ? OR readme_text LIKE ?
+		WHERE full_name LIKE ? ESCAPE '\' OR description LIKE ? ESCAPE '\'
+			OR topics LIKE ? ESCAPE '\' OR readme_text LIKE ? ESCAPE '\'
 		ORDER BY stars DESC, full_name
 	`, pattern, pattern, pattern, pattern)
 	if err != nil {
@@ -290,6 +294,35 @@ func (d *DB) SearchRepos(query string) ([]*Repo, error) {
 		repos = append(repos, r)
 	}
 	return repos, rows.Err()
+}
+
+// GetRepoByFullName returns one repository by its exact "owner/name"
+// identifier, or nil when it is not in the database. Matching is
+// case-insensitive, mirroring the GitHub identifier rules.
+func (d *DB) GetRepoByFullName(fullName string) (*Repo, error) {
+	row := d.db.QueryRow(`
+		SELECT id, node_id, owner, name, full_name, description, homepage, url, language,
+			stars, watchers, forks, open_issues, open_prs, commits, contributors,
+			topics, languages, license, is_fork, is_archived, is_private,
+			created_at, updated_at, pushed_at, last_commit_at, last_release_at, readme_text, synced_at
+		FROM repos
+		WHERE full_name = ? COLLATE NOCASE
+	`, strings.TrimSpace(fullName))
+	r, err := scanRepo(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
+// escapeLike escapes the SQL LIKE metacharacters in s. It must be paired
+// with an ESCAPE '\' clause in the query.
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // DeleteChunksForRepo removes all chunks for a repo.
@@ -338,6 +371,11 @@ func (d *DB) Search(vec []float32, k int) ([]SearchResult, error) {
 		}
 		var emb []float32
 		if err := json.Unmarshal([]byte(embStr), &emb); err != nil {
+			continue
+		}
+		// Skip chunks indexed with a different embedding model/dimension:
+		// they are not comparable with the query vector.
+		if len(emb) != len(vec) {
 			continue
 		}
 		// Store distance as 1 - cosine_similarity so lower is closer.

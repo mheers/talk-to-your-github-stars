@@ -20,11 +20,13 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables.
+//
+// GITHUB_TOKEN is optional here because only `sync` talks to the GitHub
+// API. The other subcommands (`ingest`, `chat`, `ask`, `mcp`) only read
+// the local database and work without a token; `sync` validates the
+// token itself and fails with a clear message when it is missing.
 func Load() (*Config, error) {
 	gh := os.Getenv("GITHUB_TOKEN")
-	if gh == "" {
-		return nil, fmt.Errorf("GITHUB_TOKEN environment variable is required")
-	}
 
 	dataDir := os.Getenv("TTYGS_DATA_HOME")
 	if dataDir == "" {

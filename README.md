@@ -2,7 +2,9 @@
 
 A small, fast Go TUI for chatting with your starred GitHub repositories. It downloads your stars, stores structured metadata + READMEs in SQLite, creates embeddings, and runs a local RAG-style chat so you can ask things like *“I’m building a Go OAuth server—what libraries do I have starred?”*.
 
-> **Status:** working MVP. The vector search is currently a lightweight pure-Go cosine similarity search over embeddings stored in SQLite. `sqlite-vec` integration and an MCP server are planned next.
+It also ships an **MCP server** so any coding agent (Claude Desktop, VS Code, etc.) can query the same database through a small set of tools, plus a ready-to-import **agent skill** that teaches the agent when and how to use them.
+
+> **Status:** working MVP. The vector search is currently a lightweight pure-Go cosine similarity search over embeddings stored in SQLite. `sqlite-vec` integration is still planned.
 
 ## Features
 
@@ -12,13 +14,15 @@ A small, fast Go TUI for chatting with your starred GitHub repositories. It down
 - OpenAI-compatible embeddings + chat (works with OpenAI, Ollama, etc.).
 - Interactive Bubble Tea chat TUI.
 - One-shot `ask` command for terminal usage.
+- **MCP server** (`ttygs mcp`) exposing `list_repos`, `get_repo`, and `vector_search` over stdio, plus a `ttygs://repo/{owner}/{name}` resource template.
+- **Agent skill** at `.github/skills/talk-to-github-stars/` (auto-discovered by VS Code / GitHub Copilot) that teaches a coding agent how to use those tools.
 - Pure-Go build — no CGO or system SQLite headers required.
 
 ## Requirements
 
-- [Go](https://go.dev/) 1.23+
-- A GitHub personal access token (`GITHUB_TOKEN`)
-- An OpenAI-compatible API key/endpoint (`OPENAI_API_KEY` and optional `OPENAI_BASE_URL`)
+- [Go](https://go.dev/) 1.25+
+- A GitHub personal access token (`GITHUB_TOKEN`) — required for `sync`
+- An OpenAI-compatible API key/endpoint (`OPENAI_API_KEY` and optional `OPENAI_BASE_URL`) — required for `ingest`, `ask`, `chat`, and `vector_search`
 
 ## Obtaining a GitHub Personal Access Token
 
@@ -43,15 +47,17 @@ All settings are environment variables:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `GITHUB_TOKEN` | yes | — | GitHub personal access token |
-| `OPENAI_API_KEY` | yes* | — | API key for embeddings + chat |
+| `GITHUB_TOKEN` | for `sync` | — | GitHub personal access token |
+| `OPENAI_API_KEY` | for `ingest`/`ask`/`chat`/`vector_search` | — | API key for embeddings + chat |
 | `OPENAI_BASE_URL` | no | `https://api.openai.com/v1` | Compatible endpoint (e.g. Ollama) |
 | `TTYGS_EMBEDDING_MODEL` | no | `text-embedding-3-small` | Embedding model |
 | `TTYGS_CHAT_MODEL` | no | `gpt-4o-mini` | Chat model |
 | `TTYGS_EMBEDDING_DIM` | no | `1536` | Embedding dimension |
 | `TTYGS_DATA_HOME` | no | `./data` | Database/cache directory (relative to the working directory; gitignored by default). Each repo is also persisted here as `repos/orgname/reponame/metadata.json` and `readme.md`. |
 
-\* Required for `sync` only via GitHub; required for `ingest`, `ask`, and `chat`.
+`GITHUB_TOKEN` is only read by `ttygs sync`. The other subcommands open the
+local database and never call the GitHub API, so `ttygs mcp`, `ttygs chat`,
+`ttygs ask`, and `ttygs ingest` work without a token.
 
 ## Usage
 
@@ -103,24 +109,118 @@ export TTYGS_CHAT_MODEL=qwen3.5
 ./ttygs ask "I'm building a static site generator, what should I use?"
 ```
 
+### 5. MCP server (for coding agents)
+
+`ttygs mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io/)
+server on stdio. It exposes the local database to any MCP-compatible
+client (Claude Desktop, VS Code, Continue, etc.) and is read-only.
+
+The server registers three tools and one resource template:
+
+| Name | Purpose |
+|---|---|
+| `list_repos` | List/filter starred repos by keyword (`query`, `limit`). |
+| `get_repo` | Fetch one repo by `owner/name`, optionally with its full README. |
+| `vector_search` | Semantic search over README chunks (needs an embedding model). |
+| Resource `ttygs://repo/{owner}/{name}` | Compact JSON metadata for one repo. |
+
+The `vector_search` tool needs an embedding model (`OPENAI_API_KEY`, or
+`OPENAI_BASE_URL` pointing at Ollama + `TTYGS_EMBEDDING_MODEL`). The other
+two tools work without it.
+
+#### Configure Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ttygs": {
+      "command": "/absolute/path/to/ttygs",
+      "args": ["mcp"],
+      "env": {
+        "TTYGS_DATA_HOME": "/absolute/path/to/data",
+        "OPENAI_BASE_URL": "http://localhost:11434/v1",
+        "OPENAI_API_KEY": "ollama",
+        "TTYGS_EMBEDDING_MODEL": "nomic-embed-text",
+        "TTYGS_EMBEDDING_DIM": "768"
+      }
+    }
+  }
+}
+```
+
+`TTYGS_DATA_HOME` must point at the directory that contains `stars.db`
+(created by `ttygs sync`).
+
+#### Configure VS Code
+
+Create `.vscode/mcp.json` in your workspace (or user-level):
+
+```json
+{
+  "servers": {
+    "ttygs": {
+      "command": "/absolute/path/to/ttygs",
+      "args": ["mcp"],
+      "env": {
+        "TTYGS_DATA_HOME": "${userHome}/ttygs-data"
+      }
+    }
+  }
+}
+```
+
+#### Import the agent skill
+
+This repository ships a ready-made agent skill at
+[`.github/skills/talk-to-github-stars/`](.github/skills/talk-to-github-stars/).
+VS Code and GitHub Copilot auto-discover skills in `.github/skills/`; other
+runtimes use different locations (Claude Code reads `.claude/skills/` and
+`~/.claude/skills/`, and several clients also read `.agents/skills/`).
+
+For Claude Code, copy or symlink the skill into one of its directories:
+
+```bash
+mkdir -p .claude/skills
+ln -s ../../.github/skills/talk-to-github-stars .claude/skills/talk-to-github-stars
+```
+
+The skill teaches the agent:
+
+- when to use the MCP tools (vs. searching the web),
+- which tool fits which kind of question,
+- a standard procedure to deduplicate and cite results,
+- how to recover when the database is empty or stale,
+- a `scripts/verify.sh` health check.
+
+For agent runtimes that read skills from a different location, copy the
+folder to the appropriate place — for example
+`~/.claude/skills/talk-to-github-stars/` (Claude Code) or
+`~/.copilot/skills/talk-to-github-stars/` (Copilot CLI).
+
 ## Project layout
 
 ```
-cmd/ttygs/         CLI entrypoint
-internal/config/   Environment-based configuration
-internal/github/   GitHub GraphQL/REST client
-internal/store/    On-disk repo metadata + README persistence
-internal/db/       SQLite schema + pure-Go vector search
-internal/embed/    OpenAI-compatible embeddings
-internal/llm/      OpenAI-compatible chat completions
-internal/rag/      Chunking, ingestion, retrieval, prompts
-internal/tui/      Bubble Tea chat interface
+cmd/ttygs/              CLI entrypoint
+internal/config/        Environment-based configuration
+internal/github/        GitHub GraphQL/REST client
+internal/store/         On-disk repo metadata + README persistence
+internal/db/            SQLite schema + pure-Go vector search
+internal/embed/         OpenAI-compatible embeddings
+internal/llm/           OpenAI-compatible chat completions
+internal/rag/           Chunking, ingestion, retrieval, prompts
+internal/mcpserver/     MCP server (stdio) exposing the local DB
+internal/tui/           Bubble Tea chat interface
+.github/skills/         Copilot/VS Code agent skills (auto-discovered)
+  talk-to-github-stars/   Skill for using the ttygs MCP server
 ```
 
 ## Roadmap
 
 - [ ] `sqlite-vec` integration (swap pure-Go search for the extension)
-- [ ] MCP server exposing starred-repo search + README retrieval
+- [x] MCP server exposing starred-repo search + README retrieval
+- [x] Agent skill (`.github/skills/talk-to-github-stars/`) for using it
 - [ ] Incremental sync (only update changed repos)
 - [ ] Custom per-repo notes/tags
 
