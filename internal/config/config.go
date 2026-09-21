@@ -7,6 +7,10 @@ import (
 	"strconv"
 )
 
+// defaultRerankMin mirrors judge.DefaultMinRelevance; config stays free of
+// the judge package's dependencies.
+const defaultRerankMin = 0.5
+
 // Config holds all runtime configuration.
 type Config struct {
 	GitHubToken    string
@@ -17,6 +21,12 @@ type Config struct {
 	EmbeddingDim   int
 	DataDir        string
 	DBPath         string
+	// Rerank enables TypeSafe (System One / Jev) judgements over retrieval
+	// results. It is opt-in: TTYGS_RERANK=1 plus TYPESAFE_API_KEY.
+	Rerank bool
+	// RerankMin is the lowest judged relevance that still reaches the
+	// answering model when Rerank is enabled.
+	RerankMin float64
 }
 
 // Load reads configuration from environment variables.
@@ -60,6 +70,14 @@ func Load() (*Config, error) {
 		base = "https://api.openai.com/v1"
 	}
 
+	// TypeSafe reranking is opt-in and independent of the OpenAI-compatible
+	// endpoint above. The TypeSafe SDK reads TYPESAFE_API_KEY itself.
+	rerank, _ := strconv.ParseBool(os.Getenv("TTYGS_RERANK"))
+	rerankMin, err := strconv.ParseFloat(os.Getenv("TTYGS_RERANK_MIN"), 64)
+	if err != nil || rerankMin <= 0 || rerankMin > 1 {
+		rerankMin = defaultRerankMin
+	}
+
 	return &Config{
 		GitHubToken:    gh,
 		OpenAIKey:      os.Getenv("OPENAI_API_KEY"),
@@ -69,5 +87,7 @@ func Load() (*Config, error) {
 		EmbeddingDim:   dim,
 		DataDir:        dataDir,
 		DBPath:         filepath.Join(dataDir, "stars.db"),
+		Rerank:         rerank,
+		RerankMin:      rerankMin,
 	}, nil
 }

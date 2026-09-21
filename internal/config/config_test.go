@@ -28,6 +28,8 @@ func TestLoadCreatesDataHomeAndUsesDefaults(t *testing.T) {
 	t.Setenv("TTYGS_EMBEDDING_MODEL", "")
 	t.Setenv("TTYGS_CHAT_MODEL", "")
 	t.Setenv("TTYGS_EMBEDDING_DIM", "")
+	t.Setenv("TTYGS_RERANK", "")
+	t.Setenv("TTYGS_RERANK_MIN", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -53,6 +55,47 @@ func TestLoadCreatesDataHomeAndUsesDefaults(t *testing.T) {
 	}
 	if cfg.EmbeddingDim != 1536 {
 		t.Fatalf("EmbeddingDim: got %d", cfg.EmbeddingDim)
+	}
+	if cfg.Rerank {
+		t.Fatal("reranking must be opt-in; expected Rerank to be false by default")
+	}
+	if cfg.RerankMin != 0.5 {
+		t.Fatalf("RerankMin: got %v, want 0.5", cfg.RerankMin)
+	}
+}
+
+func TestLoadRerankOptions(t *testing.T) {
+	t.Setenv("TTYGS_DATA_HOME", t.TempDir())
+	t.Setenv("TTYGS_RERANK", "1")
+	t.Setenv("TTYGS_RERANK_MIN", "0.7")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Rerank {
+		t.Fatal("expected Rerank to be enabled by TTYGS_RERANK=1")
+	}
+	if cfg.RerankMin != 0.7 {
+		t.Fatalf("RerankMin: got %v, want 0.7", cfg.RerankMin)
+	}
+
+	t.Setenv("TTYGS_RERANK_MIN", "not-a-number")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RerankMin != 0.5 {
+		t.Fatalf("RerankMin with invalid input: got %v, want the 0.5 default", cfg.RerankMin)
+	}
+
+	t.Setenv("TTYGS_RERANK", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Rerank {
+		t.Fatal("expected Rerank to be disabled by TTYGS_RERANK=0")
 	}
 }
 

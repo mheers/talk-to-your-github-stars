@@ -16,6 +16,7 @@ import (
 	"github.com/mheers/talk-to-your-github-stars/internal/config"
 	"github.com/mheers/talk-to-your-github-stars/internal/db"
 	"github.com/mheers/talk-to-your-github-stars/internal/embed"
+	"github.com/mheers/talk-to-your-github-stars/internal/judge"
 	"github.com/mheers/talk-to-your-github-stars/internal/llm"
 	"github.com/mheers/talk-to-your-github-stars/internal/rag"
 )
@@ -64,6 +65,7 @@ type Model struct {
 	db       *db.DB
 	embedder *embed.Client
 	llm      *llm.Client
+	reranker judge.Reranker // optional; nil keeps plain vector retrieval
 	program  *tea.Program
 
 	viewport    viewport.Model
@@ -83,8 +85,9 @@ type Model struct {
 	detailRepo    *db.Repo
 }
 
-// New creates a new TUI model.
-func New(cfg *config.Config, database *db.DB, embedder *embed.Client, llm *llm.Client) *Model {
+// New creates a new TUI model. reranker may be nil to disable TypeSafe
+// judging of retrieval results.
+func New(cfg *config.Config, database *db.DB, embedder *embed.Client, llm *llm.Client, reranker judge.Reranker) *Model {
 	ta := textarea.New()
 	ta.SetWidth(80)
 	ta.SetHeight(3)
@@ -133,6 +136,7 @@ func New(cfg *config.Config, database *db.DB, embedder *embed.Client, llm *llm.C
 		db:          database,
 		embedder:    embedder,
 		llm:         llm,
+		reranker:    reranker,
 		textarea:    ta,
 		viewport:    vp,
 		spinner:     s,
@@ -515,11 +519,20 @@ func (m *Model) appendBot(text string) {
 func (m *Model) run(query string) {
 	ctx := context.Background()
 
-	results, err := rag.Retrieve(ctx, m.db, m.embedder, query, 10)
+	retrieval, err := rag.Retrieve(ctx, m.db, m.embedder, m.reranker, query, 10)
 	if err != nil {
 		m.program.Send(doneMsg{err: err})
 		return
 	}
+	if retrieval.RerankErr != nil {
+		m.program.Send(streamMsg{content: hintStyle.Render("(re-ranking unavailable; showing raw search results)") + "\n"})
+	}
+	if len(retrieval.Results) == 0 {
+		m.program.Send(streamMsg{content: rag.NoMatchMessage})
+		m.program.Send(doneMsg{})
+		return
+	}
+	results := retrieval.Results
 
 	var sources []string
 	seen := map[string]bool{}

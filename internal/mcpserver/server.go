@@ -16,6 +16,8 @@ import (
 
 	"github.com/mheers/talk-to-your-github-stars/internal/db"
 	"github.com/mheers/talk-to-your-github-stars/internal/embed"
+	"github.com/mheers/talk-to-your-github-stars/internal/judge"
+	"github.com/mheers/talk-to-your-github-stars/internal/rag"
 )
 
 // ServerName is the MCP server name advertised to clients.
@@ -35,7 +37,8 @@ const ReadmeTruncatedMarker = "\n\n…[truncated]"
 type Server struct {
 	server   *mcp.Server
 	database *db.DB
-	emb      *embed.Client // optional; nil disables semantic search
+	emb      *embed.Client  // optional; nil disables semantic search
+	reranker judge.Reranker // optional; nil disables TypeSafe judging
 }
 
 // New builds an MCP server backed by the given database.
@@ -66,6 +69,13 @@ func (s *Server) Run(ctx context.Context) error {
 // that need to bind the server to a non-stdio transport (e.g. in-memory).
 func (s *Server) MCPServer() *mcp.Server {
 	return s.server
+}
+
+// WithReranker enables TypeSafe (System One / Jev) judgements over vector
+// search results. A nil reranker keeps plain cosine ranking.
+func (s *Server) WithReranker(r judge.Reranker) *Server {
+	s.reranker = r
+	return s
 }
 
 // ----- tool input/output types ----------------------------------------------
@@ -131,6 +141,11 @@ type vectorSearchHit struct {
 	RepoDescription string  `json:"repo_description,omitempty"`
 	Text            string  `json:"text"`
 	Score           float64 `json:"score"`
+	// Relevance is the judged relevance in [0,1] when TypeSafe judging is
+	// enabled; absent otherwise. Confidence describes how peaked the judged
+	// score distribution was.
+	Relevance           *float64 `json:"relevance,omitempty"`
+	RelevanceConfidence *float64 `json:"relevance_confidence,omitempty"`
 }
 
 // vectorSearchOutput is the output of the vector_search tool.
@@ -138,6 +153,11 @@ type vectorSearchOutput struct {
 	Query string            `json:"query"`
 	K     int               `json:"k"`
 	Hits  []vectorSearchHit `json:"hits"`
+	// Reranked reports whether TypeSafe judged the hits.
+	Reranked bool `json:"reranked,omitempty"`
+	// Answerable is the judged probability that the user's stars contain a
+	// direct match for the query, in [0,1]. Only present when Reranked.
+	Answerable *float64 `json:"answerable,omitempty"`
 }
 
 // ----- tool handlers --------------------------------------------------------
@@ -230,32 +250,35 @@ func (s *Server) handleVectorSearch(ctx context.Context, _ *mcp.CallToolRequest,
 		k = 50
 	}
 
-	vecs, err := s.emb.Embed(ctx, []string{in.Query})
+	retrieval, err := rag.Retrieve(ctx, s.database, s.emb, s.reranker, in.Query, k)
 	if err != nil {
-		return nil, vectorSearchOutput{}, fmt.Errorf("embed query: %w", err)
-	}
-	if len(vecs) == 0 || vecs[0] == nil {
-		return nil, vectorSearchOutput{}, fmt.Errorf("empty embedding returned")
-	}
-
-	results, err := s.database.Search(vecs[0], k)
-	if err != nil {
-		return nil, vectorSearchOutput{}, fmt.Errorf("vector search: %w", err)
+		return nil, vectorSearchOutput{}, err
 	}
 
 	out := vectorSearchOutput{
-		Query: in.Query,
-		K:     k,
-		Hits:  make([]vectorSearchHit, 0, len(results)),
+		Query:    in.Query,
+		K:        k,
+		Reranked: retrieval.Reranked,
+		Hits:     make([]vectorSearchHit, 0, len(retrieval.Results)),
 	}
-	for _, r := range results {
-		out.Hits = append(out.Hits, vectorSearchHit{
+	if retrieval.Reranked {
+		answerable := retrieval.Answerable
+		out.Answerable = &answerable
+	}
+	for _, r := range retrieval.Results {
+		hit := vectorSearchHit{
 			ChunkID:         r.ChunkID,
 			RepoFullName:    r.RepoFullName,
 			RepoDescription: r.RepoDescription,
 			Text:            r.Text,
 			Score:           1 - r.Distance, // cosine similarity
-		})
+		}
+		if judged, ok := retrieval.Relevance[r.RepoFullName]; ok {
+			relevance, confidence := judged.Relevance, judged.Confidence
+			hit.Relevance = &relevance
+			hit.RelevanceConfidence = &confidence
+		}
+		out.Hits = append(out.Hits, hit)
 	}
 	return nil, out, nil
 }
@@ -309,7 +332,10 @@ func (s *Server) registerTools() {
 		Description: "Semantic search over README chunks. " +
 			"Embeds the query with the configured OpenAI-compatible embedding model " +
 			"and returns the top-k most similar chunks across all starred repos. " +
-			"Each hit includes the repository it came from and a relevance score in [0,1]. " +
+			"Each hit includes the repository it came from and the cosine retrieval score in [0,1]. " +
+			"When the server has TypeSafe judging enabled, hits also carry a judged relevance in [0,1] " +
+			"and the response carries an `answerable` probability: if `answerable` is low, tell the user " +
+			"nothing in their stars matches instead of forcing a recommendation. " +
 			"Requires OPENAI_API_KEY to be set when the server starts.",
 	}, s.handleVectorSearch)
 }

@@ -70,7 +70,7 @@ Linux: `~/.config/Claude/claude_desktop_config.json`
 |--------|-------|
 | `command` | absolute path to `ttygs` |
 | `args`    | `["mcp"]` |
-| `env`     | (optional) `TTYGS_DATA_HOME`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `TTYGS_EMBEDDING_MODEL`, `TTYGS_EMBEDDING_DIM` |
+| `env`     | (optional) `TTYGS_DATA_HOME`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `TTYGS_EMBEDDING_MODEL`, `TTYGS_EMBEDDING_DIM`, `TTYGS_RERANK`, `TTYGS_RERANK_MIN`, `TYPESAFE_API_KEY` |
 
 ## Enabling vector search (optional)
 
@@ -106,6 +106,24 @@ ollama pull nomic-embed-text
 If `OPENAI_API_KEY` is empty when the server starts, the server logs a
 warning and the `vector_search` tool returns a friendly error explaining how
 to fix it. The other two tools continue to work.
+
+## Judged results with TypeSafe (optional)
+
+Set these to have `vector_search` results judged by TypeSafe's Jev instead of
+trusting cosine similarity alone:
+
+```json
+"env": {
+  "TYPESAFE_API_KEY": "...",
+  "TTYGS_RERANK": "1",
+  "TTYGS_RERANK_MIN": "0.5"
+}
+```
+
+With judging enabled, `vector_search` returns `reranked`, an `answerable`
+probability, and a per-hit `relevance`. If the API key is missing or a
+judgement call fails, the server logs a warning and falls back to plain
+vector search — no configuration error and no failed tool call.
 
 ## Verifying the connection
 

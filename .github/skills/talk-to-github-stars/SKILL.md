@@ -75,7 +75,13 @@ Use them in this order of preference.
 
 Returns a list of `hits`. Each hit has `repo_full_name`, `repo_description`,
 `text` (a README excerpt with a header showing the repo name), and `score` in
-[0, 1] (cosine similarity, higher is better).
+[0, 1] (cosine retrieval similarity, higher is better).
+
+When the server runs with TypeSafe judging enabled (`TTYGS_RERANK=1`), the
+response also carries `reranked: true` and an `answerable` probability, and
+each hit carries a judged `relevance` in [0, 1]. In that case prefer
+`relevance` over `score`, and treat a low `answerable` as "the user's stars
+do not contain a match".
 
 Requires an embedding model to be configured on the server.
 
@@ -138,6 +144,8 @@ Follow these steps for any question about the user's stars.
 5. **Be honest about gaps.** If the database has no matches:
    - Do NOT invent libraries. Tell the user you couldn't find a match in
      their stars and ask whether to broaden the search.
+   - When `vector_search` reports a low `answerable` probability, say plainly
+     that their stars do not contain a match instead of forcing a suggestion.
    - Suggest running `ttygs sync` if the database looks stale or empty
      (see [troubleshooting.md](./references/troubleshooting.md)).
 

@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/google/go-github/v69 v69.2.0
+	github.com/mheers/typesafeai-systemone-jev-go v0.1.0
 	github.com/modelcontextprotocol/go-sdk v1.1.0
 	github.com/ncruces/go-sqlite3 v0.17.1
 	github.com/sashabaranov/go-openai v1.41.2

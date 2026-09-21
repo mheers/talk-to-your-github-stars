@@ -16,6 +16,7 @@ import (
 	"github.com/mheers/talk-to-your-github-stars/internal/db"
 	"github.com/mheers/talk-to-your-github-stars/internal/embed"
 	"github.com/mheers/talk-to-your-github-stars/internal/github"
+	"github.com/mheers/talk-to-your-github-stars/internal/judge"
 	"github.com/mheers/talk-to-your-github-stars/internal/llm"
 	"github.com/mheers/talk-to-your-github-stars/internal/mcpserver"
 	"github.com/mheers/talk-to-your-github-stars/internal/rag"
@@ -135,7 +136,7 @@ func chatCmd() {
 	cfg, database, emb, llmClient := loadBase()
 	defer database.Close()
 
-	m := tui.New(cfg, database, emb, llmClient)
+	m := tui.New(cfg, database, emb, llmClient, newReranker(cfg))
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	m.SetProgram(p)
 	if _, err := p.Run(); err != nil {
@@ -155,22 +156,45 @@ func askCmd(args []string) {
 		log.Fatal("ask requires a query argument")
 	}
 
-	_, database, emb, llmClient := loadBase()
+	cfg, database, emb, llmClient := loadBase()
 	defer database.Close()
 
 	ctx := context.Background()
-	results, err := rag.Retrieve(ctx, database, emb, query, *k)
+	retrieval, err := rag.Retrieve(ctx, database, emb, newReranker(cfg), query, *k)
 	if err != nil {
 		log.Fatalf("retrieve: %v", err)
 	}
+	if retrieval.RerankErr != nil {
+		log.Printf("[rerank] %v", retrieval.RerankErr)
+	}
+	if len(retrieval.Results) == 0 {
+		fmt.Println(rag.NoMatchMessage)
+		return
+	}
 
-	system := rag.BuildSystemPrompt(results)
+	system := rag.BuildSystemPrompt(retrieval.Results)
 	answer, err := llmClient.Complete(ctx, system, query)
 	if err != nil {
 		log.Fatalf("complete: %v", err)
 	}
 
 	fmt.Println(answer)
+}
+
+// newReranker builds the optional TypeSafe judge client. Reranking is
+// opt-in (TTYGS_RERANK=1) and degrades to plain vector search when the
+// client cannot be built.
+func newReranker(cfg *config.Config) judge.Reranker {
+	if !cfg.Rerank {
+		return nil
+	}
+	client, err := judge.New(judge.Options{MinRelevance: cfg.RerankMin})
+	if err != nil {
+		log.Printf("[rerank] TTYGS_RERANK is set but the TypeSafe client is unavailable (%v); using plain vector search", err)
+		return nil
+	}
+	log.Printf("[rerank] TypeSafe judging enabled (model=%s, min relevance=%.2f)", client.Model(), cfg.RerankMin)
+	return client
 }
 
 // mcpCmd runs the MCP server on stdio. It exposes the local stars database
@@ -212,7 +236,7 @@ func mcpCmd(args []string) {
 	defer cancel()
 
 	log.Printf("[mcp] starting stdio server (name=%s, version=%s, db=%s)", mcpserver.ServerName, mcpserver.ServerVersion, cfg.DBPath)
-	if err := mcpserver.New(database, emb).Run(ctx); err != nil && err != context.Canceled {
+	if err := mcpserver.New(database, emb).WithReranker(newReranker(cfg)).Run(ctx); err != nil && err != context.Canceled {
 		log.Fatalf("mcp server: %v", err)
 	}
 }

@@ -39,6 +39,19 @@ Set these env vars in the MCP config:
 
 For Ollama, see [mcp-config.md](./mcp-config.md#ollama-local-free).
 
+## vector_search returns fewer hits than k, or none at all
+
+If the server runs with `TTYGS_RERANK=1`, results are judged and filtered:
+repositories below `TTYGS_RERANK_MIN` (default 0.5) are withheld, and only one
+chunk per repository is returned. That is intended — the `answerable`
+probability in the response tells you whether the user's stars contain a
+match at all.
+
+- To widen the net, lower `TTYGS_RERANK_MIN` (for example `0.3`).
+- To turn judging off entirely, unset `TTYGS_RERANK`.
+- If `answerable` is low, tell the user their stars do not contain a match
+  rather than lowering the floor to force one.
+
 ## "Found 0 results" / empty list
 
 The database has no stars indexed yet. Tell the user to run, in order:

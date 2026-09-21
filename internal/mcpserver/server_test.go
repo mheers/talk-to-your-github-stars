@@ -17,6 +17,7 @@ import (
 	"github.com/mheers/talk-to-your-github-stars/internal/config"
 	"github.com/mheers/talk-to-your-github-stars/internal/db"
 	"github.com/mheers/talk-to-your-github-stars/internal/embed"
+	"github.com/mheers/talk-to-your-github-stars/internal/judge"
 	"github.com/mheers/talk-to-your-github-stars/internal/mcpserver"
 )
 
@@ -112,10 +113,16 @@ func seedRepos(t *testing.T, d *db.DB) {
 // server and returns the session. emb may be nil (vector_search disabled).
 func startTestSession(t *testing.T, database *db.DB, emb *embed.Client) *mcp.ClientSession {
 	t.Helper()
+	return startSessionWith(t, database, emb, nil)
+}
+
+// startSessionWith is startTestSession with an optional judge.
+func startSessionWith(t *testing.T, database *db.DB, emb *embed.Client, reranker judge.Reranker) *mcp.ClientSession {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	server := mcpserver.New(database, emb).MCPServer()
+	server := mcpserver.New(database, emb).WithReranker(reranker).MCPServer()
 
 	st, ct := mcp.NewInMemoryTransports()
 
@@ -233,15 +240,30 @@ type listOut struct {
 
 // vectorOut mirrors the vector_search output shape.
 type vectorOut struct {
-	Query string `json:"query"`
-	K     int    `json:"k"`
-	Hits  []struct {
-		ChunkID      int64   `json:"chunk_id"`
-		RepoFullName string  `json:"repo_full_name"`
-		Text         string  `json:"text"`
-		Score        float64 `json:"score"`
+	Query      string   `json:"query"`
+	K          int      `json:"k"`
+	Reranked   bool     `json:"reranked"`
+	Answerable *float64 `json:"answerable"`
+	Hits       []struct {
+		ChunkID      int64    `json:"chunk_id"`
+		RepoFullName string   `json:"repo_full_name"`
+		Text         string   `json:"text"`
+		Score        float64  `json:"score"`
+		Relevance    *float64 `json:"relevance"`
 	} `json:"hits"`
 }
+
+// testReranker is a canned judge for MCP tests.
+type testReranker struct {
+	ranking judge.Ranking
+	err     error
+}
+
+func (r *testReranker) Rank(context.Context, string, []judge.Candidate) (judge.Ranking, error) {
+	return r.ranking, r.err
+}
+
+func (r *testReranker) MinRelevance() float64 { return 0.5 }
 
 func TestListRepos_AllAndFiltered(t *testing.T) {
 	d := newTestDB(t)
@@ -536,6 +558,71 @@ func TestGetRepoTruncatesOnRuneBoundary(t *testing.T) {
 	}
 	if len(out.Readme) > 11+len(readmeTruncatedMarker) {
 		t.Fatalf("expected at most %d bytes, got %d", 11+len(readmeTruncatedMarker), len(out.Readme))
+	}
+}
+
+func TestVectorSearch_Reranked(t *testing.T) {
+	d := newTestDB(t)
+	seedRepos(t, d)
+
+	chunks := []struct {
+		repoID int64
+		text   string
+		vec    []float32
+	}{
+		{101, "foo/bar chunk", []float32{1, 0, 0}},
+		{102, "acme/widgets chunk", []float32{0, 1, 0}},
+		{103, "rusty/ferrite chunk", []float32{0.5, 0.5, 0}},
+	}
+	for _, c := range chunks {
+		id, err := d.InsertChunk(c.repoID, c.text, "readme")
+		if err != nil {
+			t.Fatalf("insert chunk: %v", err)
+		}
+		if err := d.InsertVec(id, c.vec); err != nil {
+			t.Fatalf("insert vec: %v", err)
+		}
+	}
+
+	emb := mockEmbedder(t, 3, func(string) []float32 { return []float32{1, 0, 0} })
+	reranker := &testReranker{ranking: judge.Ranking{
+		Answerable: 0.88,
+		Items: []judge.RankedCandidate{
+			{ID: "foo/bar", Relevance: 0.9, Confidence: 0.9},
+			{ID: "acme/widgets", Relevance: 0.2, Confidence: 0.6},
+			{ID: "rusty/ferrite", Relevance: 0.7, Confidence: 0.8},
+		},
+	}}
+	cs := startSessionWith(t, d, emb, reranker)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "vector_search",
+		Arguments: map[string]any{"query": "a Go library", "k": 5},
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	out := structured[vectorOut](t, res)
+
+	if !out.Reranked {
+		t.Fatal("expected reranked=true")
+	}
+	if out.Answerable == nil || *out.Answerable != 0.88 {
+		t.Fatalf("answerable: %v", out.Answerable)
+	}
+	if len(out.Hits) != 2 {
+		t.Fatalf("expected the two hits above the relevance floor, got %d", len(out.Hits))
+	}
+	if out.Hits[0].RepoFullName != "foo/bar" || out.Hits[1].RepoFullName != "rusty/ferrite" {
+		t.Fatalf("expected judged order, got %v, %v", out.Hits[0].RepoFullName, out.Hits[1].RepoFullName)
+	}
+	if out.Hits[0].Relevance == nil || *out.Hits[0].Relevance != 0.9 {
+		t.Fatalf("first hit relevance: %v", out.Hits[0].Relevance)
+	}
+	for _, hit := range out.Hits {
+		if hit.RepoFullName == "acme/widgets" {
+			t.Fatal("a candidate below the relevance floor leaked into the results")
+		}
 	}
 }
 

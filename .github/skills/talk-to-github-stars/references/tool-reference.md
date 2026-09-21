@@ -134,13 +134,17 @@ Semantic search over README chunks.
 {
   "query": "small Go CLI for working with CSV files",
   "k": 10,
+  "reranked": true,
+  "answerable": 0.91,
   "hits": [
     {
       "chunk_id": 42,
       "repo_full_name": "foo/bar",
       "repo_description": "A small CLI for working with csv files",
       "text": "Repository: foo/bar\nDescription: ...\nExcerpt: ...",
-      "score": 0.83
+      "score": 0.83,
+      "relevance": 0.97,
+      "relevance_confidence": 0.88
     }
   ]
 }
@@ -154,13 +158,31 @@ Semantic search over README chunks.
   `Repository: ...\nDescription: ...\nTopics: ...\nPrimary language: ...\nStars: ...`
   prepended to the README excerpt, so the embedding captures the repo
   context as well as the README text.
-- `score` is **cosine similarity in [0, 1]**; higher is more relevant.
+- `score` is **cosine similarity in [0, 1]** between the query and the chunk;
+  it measures textual closeness, not usefulness.
 - Hits are ordered by descending score. `k` values of `0` or less use the
   default (10); values above 50 are capped at 50.
 - Chunks that were embedded with a different model or vector dimension
   than the query embedding are skipped, so a database ingested with
   another embedding model simply yields no hits (re-run `ttygs ingest`
   with the configured model to index it).
+
+### Judged results (optional)
+
+When the server runs with `TTYGS_RERANK=1` and a TypeSafe API key, the tool
+widens the shortlist, sends it to TypeSafe's Jev for judgement, and returns
+the re-ranked result:
+
+- `reranked` is `true`.
+- `answerable` is the judged probability in [0, 1] that the shortlist
+  contains a repository that directly satisfies the query. Report gaps
+  honestly when it is low.
+- Each hit carries `relevance` in [0, 1] — how well the repository satisfies
+  the need — and `relevance_confidence` for how peaked the judgement was.
+  Prefer `relevance` for ranking and citations.
+- Results keep one chunk per repository, and candidates below
+  `TTYGS_RERANK_MIN` (default 0.5) are withheld, so a response can contain
+  fewer hits than `k`.
 
 ### When the embedder is not configured
 
