@@ -4,12 +4,12 @@ A small, fast Go TUI for chatting with your starred GitHub repositories. It down
 
 It also ships an **MCP server** so any coding agent (Claude Desktop, VS Code, etc.) can query the same database through a small set of tools, plus a ready-to-import **agent skill** that teaches the agent when and how to use them.
 
-> **Status:** working MVP. The vector search is currently a lightweight pure-Go cosine similarity search over embeddings stored in SQLite. `sqlite-vec` integration is still planned.
+> **Status:** working MVP. The vector search is a lightweight pure-Go cosine similarity search over embeddings stored as compact float32 blobs in SQLite; databases written by older builds are migrated automatically on first open, and `sqlite3 data/stars.db VACUUM` reclaims the space the old JSON representation used. `sqlite-vec` integration is still planned for much larger corpora.
 
 ## Features
 
 - One-command sync of all your GitHub stars (GraphQL for metadata, REST for READMEs).
-- SQLite database with repo metadata, topics, languages, README text, and chunk embeddings.
+- SQLite database with repo metadata, topics, languages, README text, and chunk embeddings (compact float32 blobs).
 - Mirror of each repo as `data/repos/orgname/reponame/metadata.json` + `readme.md` on disk.
 - OpenAI-compatible embeddings + chat (works with OpenAI, Ollama, etc.).
 - Interactive Bubble Tea chat TUI.

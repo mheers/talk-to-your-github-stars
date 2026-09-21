@@ -2,9 +2,11 @@ package db
 
 import (
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -13,6 +15,11 @@ import (
 	_ "github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
+
+// embeddingStorageVersion is the PRAGMA user_version at which chunk
+// embeddings are stored as raw little-endian float32 blobs. Version 0 (and
+// any unset value) used JSON arrays of float32.
+const embeddingStorageVersion = 1
 
 // Repo mirrors a starred GitHub repository in the database.
 type Repo struct {
@@ -97,6 +104,11 @@ func Open(path string, vecDim int) (*DB, error) {
 	d := &DB{db: raw}
 	if err := d.migrate(vecDim); err != nil {
 		return nil, err
+	}
+	if err := d.migrateEmbeddingStorage(); err != nil {
+		// Non-fatal: decodeEmbedding still understands the legacy JSON
+		// format, so the database stays usable.
+		log.Printf("[db] embedding storage migration skipped: %v", err)
 	}
 	return d, nil
 }
@@ -342,11 +354,54 @@ func (d *DB) InsertChunk(repoID int64, text, source string) (int64, error) {
 	return res.LastInsertId()
 }
 
-// InsertVec stores an embedding for a chunk rowid.
+// InsertVec stores an embedding for a chunk rowid as a compact
+// little-endian float32 blob.
 func (d *DB) InsertVec(rowid int64, vec []float32) error {
-	data, _ := json.Marshal(vec)
-	_, err := d.db.Exec(`UPDATE chunks SET embedding=? WHERE id=?`, string(data), rowid)
+	_, err := d.db.Exec(`UPDATE chunks SET embedding=? WHERE id=?`, encodeVec(vec), rowid)
 	return err
+}
+
+// encodeVec serializes a vector as raw little-endian float32 bytes.
+func encodeVec(vec []float32) []byte {
+	b := make([]byte, 4*len(vec))
+	for i, v := range vec {
+		binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(v))
+	}
+	return b
+}
+
+// decodeVecBlob reverses encodeVec. It reports false for data that is not
+// a whole number of float32 values.
+func decodeVecBlob(b []byte) ([]float32, bool) {
+	if len(b) == 0 || len(b)%4 != 0 {
+		return nil, false
+	}
+	vec := make([]float32, len(b)/4)
+	for i := range vec {
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:]))
+	}
+	return vec, true
+}
+
+// decodeJSONVec parses a legacy JSON array embedding.
+func decodeJSONVec(b []byte) ([]float32, bool) {
+	if len(b) < 2 || b[0] != '[' || b[len(b)-1] != ']' {
+		return nil, false
+	}
+	var vec []float32
+	if err := json.Unmarshal(b, &vec); err != nil {
+		return nil, false
+	}
+	return vec, true
+}
+
+// decodeEmbedding reads both the current float32 blob format and the
+// legacy JSON array format, so mixed databases keep working.
+func decodeEmbedding(b []byte) ([]float32, bool) {
+	if vec, ok := decodeJSONVec(b); ok {
+		return vec, true
+	}
+	return decodeVecBlob(b)
 }
 
 // Search performs a cosine-similarity vector search over chunks and returns the top-k results.
@@ -365,12 +420,12 @@ func (d *DB) Search(vec []float32, k int) ([]SearchResult, error) {
 	var scored []SearchResult
 	for rows.Next() {
 		var sr SearchResult
-		var embStr string
-		if err := rows.Scan(&sr.ChunkID, &sr.RepoID, &sr.RepoFullName, &sr.RepoDescription, &sr.Text, &embStr); err != nil {
+		var raw []byte
+		if err := rows.Scan(&sr.ChunkID, &sr.RepoID, &sr.RepoFullName, &sr.RepoDescription, &sr.Text, &raw); err != nil {
 			return nil, err
 		}
-		var emb []float32
-		if err := json.Unmarshal([]byte(embStr), &emb); err != nil {
+		emb, ok := decodeEmbedding(raw)
+		if !ok {
 			continue
 		}
 		// Skip chunks indexed with a different embedding model/dimension:
@@ -393,6 +448,89 @@ func (d *DB) Search(vec []float32, k int) ([]SearchResult, error) {
 		scored = scored[:k]
 	}
 	return scored, nil
+}
+
+// migrateEmbeddingStorage rewrites legacy JSON embeddings as float32
+// blobs. It is guarded by PRAGMA user_version, so it runs once, and it is
+// best-effort: values that do not parse as JSON are left untouched.
+func (d *DB) migrateEmbeddingStorage() error {
+	var version int
+	if err := d.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version >= embeddingStorageVersion {
+		return nil
+	}
+
+	ids, err := d.textEmbeddingIDs()
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		_, err := d.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, embeddingStorageVersion))
+		return err
+	}
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	sel, err := tx.Prepare(`SELECT embedding FROM chunks WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer sel.Close()
+	upd, err := tx.Prepare(`UPDATE chunks SET embedding = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer upd.Close()
+
+	converted := 0
+	for _, id := range ids {
+		var raw []byte
+		if err := sel.QueryRow(id).Scan(&raw); err != nil {
+			return err
+		}
+		vec, ok := decodeJSONVec(raw)
+		if !ok {
+			continue // not JSON; leave the row as-is
+		}
+		if _, err := upd.Exec(encodeVec(vec), id); err != nil {
+			return err
+		}
+		converted++
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, embeddingStorageVersion)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("[db] migrated %d embeddings to the float32 blob format", converted)
+	return nil
+}
+
+// textEmbeddingIDs returns the row ids whose embedding is still stored as
+// text (the legacy JSON format).
+func (d *DB) textEmbeddingIDs() ([]int64, error) {
+	rows, err := d.db.Query(`SELECT id FROM chunks WHERE typeof(embedding) = 'text'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func cosine(a, b []float32) float64 {

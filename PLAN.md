@@ -144,5 +144,33 @@ directory `skills/talk-to-github-stars/` was removed.
 ## Out of scope (follow-ups)
 
 - sqlite-vec migration to replace the O(n) pure-Go scan (already on the roadmap).
-- Storing embeddings as float32 BLOBs instead of JSON (would cut the ~2.2 s query time).
 - Populating `readme_path` from the on-disk mirror (removed instead).
+
+## Follow-up implemented (2026-09-21): compact embedding storage
+
+The ~2.2 s `vector_search` latency noted in C8 came from reading and
+JSON-parsing every embedding on each query. Embeddings are now stored as raw
+little-endian float32 blobs, and `Search` reads them directly.
+
+- `db.InsertVec` writes blobs; `db.Search` accepts both the blob and the
+  legacy JSON format.
+- `db.Open` runs a one-time, `PRAGMA user_version`-guarded migration that
+  rewrites legacy JSON embeddings in place (best-effort: unparsable values
+  are left alone). No re-ingestion and no API calls are required.
+- New tests cover the codec, the migration, and mixed-format reads; a
+  `BenchmarkSearch` was added.
+
+Measured on the real database (1873 repos, 18995 chunks, 768 dims):
+
+| Metric | Before | After |
+|---|---|---|
+| `vector_search` (mock embedder) | ~2.20 s | ~0.14 s |
+| Database size | 261 MB | 122 MB (after `VACUUM`) |
+| One-time migration | — | 4.5 s |
+
+Search scores before and after are identical, so the change is
+behavior-preserving apart from the format.
+
+Remaining follow-up: sqlite-vec remains the right answer at a much larger
+scale, but the pure-Go scan is now fast enough for tens of thousands of
+chunks.

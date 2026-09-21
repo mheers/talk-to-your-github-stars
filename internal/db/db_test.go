@@ -1,6 +1,7 @@
 package db
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -230,5 +231,177 @@ func TestSearchSkipsDimensionMismatch(t *testing.T) {
 	}
 	if score := 1 - results[0].Distance; score < 0.99 || score > 1.01 {
 		t.Fatalf("unexpected score: %f", score)
+	}
+}
+
+func TestEncodeDecodeVec(t *testing.T) {
+	vec := []float32{0, 1.5, -2.25, math.MaxFloat32, math.SmallestNonzeroFloat32}
+
+	got, ok := decodeVecBlob(encodeVec(vec))
+	if !ok {
+		t.Fatal("decodeVecBlob rejected encoded data")
+	}
+	if len(got) != len(vec) {
+		t.Fatalf("length: got %d, want %d", len(got), len(vec))
+	}
+	for i := range vec {
+		if got[i] != vec[i] {
+			t.Fatalf("element %d: got %v, want %v", i, got[i], vec[i])
+		}
+	}
+
+	if _, ok := decodeVecBlob([]byte{1, 2, 3}); ok {
+		t.Fatal("decodeVecBlob accepted a non-multiple of 4 bytes")
+	}
+	if _, ok := decodeVecBlob(nil); ok {
+		t.Fatal("decodeVecBlob accepted empty data")
+	}
+
+	legacy, ok := decodeJSONVec([]byte("[1, 2, 3]"))
+	if !ok || len(legacy) != 3 || legacy[2] != 3 {
+		t.Fatalf("decodeJSONVec: got %v ok=%v", legacy, ok)
+	}
+	if _, ok := decodeJSONVec([]byte("not json")); ok {
+		t.Fatal("decodeJSONVec accepted non-JSON data")
+	}
+
+	// decodeEmbedding must understand both storage formats.
+	if got, ok := decodeEmbedding(encodeVec(vec)); !ok || len(got) != len(vec) {
+		t.Fatal("decodeEmbedding rejected blob data")
+	}
+	if got, ok := decodeEmbedding([]byte("[1, 2, 3]")); !ok || len(got) != 3 {
+		t.Fatal("decodeEmbedding rejected legacy JSON data")
+	}
+}
+
+func TestEmbeddingStorageMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "migrate.db")
+
+	d, err := Open(path, 3)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	repo := &Repo{ID: 1, NodeID: "m1", Owner: "foo", Name: "bar", FullName: "foo/bar", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := d.UpsertRepo(repo); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	chunkID, err := d.InsertChunk(repo.ID, "hello", "readme")
+	if err != nil {
+		t.Fatalf("insert chunk: %v", err)
+	}
+	// Simulate a database written by an older build: JSON embedding and
+	// user_version 0.
+	if _, err := d.db.Exec(`UPDATE chunks SET embedding=? WHERE id=?`, `[1,0,0]`, chunkID); err != nil {
+		t.Fatalf("write legacy embedding: %v", err)
+	}
+	if _, err := d.db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	d2, err := Open(path, 3)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+
+	var typ string
+	if err := d2.db.QueryRow(`SELECT typeof(embedding) FROM chunks WHERE id=?`, chunkID).Scan(&typ); err != nil {
+		t.Fatalf("typeof: %v", err)
+	}
+	if typ != "blob" {
+		t.Fatalf("embedding type after migration: got %q, want blob", typ)
+	}
+
+	var version int
+	if err := d2.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if version != embeddingStorageVersion {
+		t.Fatalf("user_version: got %d, want %d", version, embeddingStorageVersion)
+	}
+
+	results, err := d2.Search([]float32{1, 0, 0}, 5)
+	if err != nil {
+		t.Fatalf("search after migration: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 hit after migration, got %d", len(results))
+	}
+	if score := 1 - results[0].Distance; score < 0.99 || score > 1.01 {
+		t.Fatalf("unexpected score: %f", score)
+	}
+}
+
+func TestSearchReadsLegacyJSONEmbeddings(t *testing.T) {
+	dir := t.TempDir()
+	d, err := Open(filepath.Join(dir, "legacy.db"), 3)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+
+	repo := &Repo{ID: 1, NodeID: "l1", Owner: "foo", Name: "bar", FullName: "foo/bar", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := d.UpsertRepo(repo); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	chunkID, err := d.InsertChunk(repo.ID, "legacy row", "readme")
+	if err != nil {
+		t.Fatalf("insert chunk: %v", err)
+	}
+	// A legacy row that appears after migration already ran (e.g. a
+	// database modified by an older binary) must still be searchable.
+	if _, err := d.db.Exec(`UPDATE chunks SET embedding=? WHERE id=?`, `[0,1,0]`, chunkID); err != nil {
+		t.Fatalf("write legacy embedding: %v", err)
+	}
+
+	results, err := d.Search([]float32{0, 1, 0}, 5)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected the legacy JSON row to be searchable, got %d hits", len(results))
+	}
+}
+
+func BenchmarkSearch(b *testing.B) {
+	dir := b.TempDir()
+	d, err := Open(filepath.Join(dir, "bench.db"), 64)
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+
+	repo := &Repo{ID: 1, NodeID: "b1", Owner: "foo", Name: "bar", FullName: "foo/bar", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := d.UpsertRepo(repo); err != nil {
+		b.Fatalf("upsert: %v", err)
+	}
+	const chunks = 2000
+	for i := 0; i < chunks; i++ {
+		id, err := d.InsertChunk(repo.ID, "some readme text for benchmarking", "readme")
+		if err != nil {
+			b.Fatalf("insert chunk: %v", err)
+		}
+		vec := make([]float32, 64)
+		for j := range vec {
+			vec[j] = float32((i*31+j*17)%100) / 100
+		}
+		if err := d.InsertVec(id, vec); err != nil {
+			b.Fatalf("insert vec: %v", err)
+		}
+	}
+	query := make([]float32, 64)
+	for j := range query {
+		query[j] = 0.5
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := d.Search(query, 10); err != nil {
+			b.Fatalf("search: %v", err)
+		}
 	}
 }
